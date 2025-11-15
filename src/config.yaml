@@ -1,0 +1,90 @@
+data:
+  # Name of the raw dataset file WITHOUT extension.
+  # Expected file path: RAW_DATA_DIR / <fname>.jsonl.gz
+  fname: "meta_Beauty_5"
+
+  # Dataset source type ("amazon" supported, "yelp" optional)
+  source: "amazon"
+
+  # Test split ratio for the entire dataset
+  test_size: 0.2
+
+  # Validation split ratio (must be smaller than test_size)
+  val_size: 0.1
+
+  # Random seed used for train/val/test splitting
+  random_state: 42
+
+
+train:
+  # Device to use ("cuda" or "cpu").
+  # If cuda is not available, main.py automatically switches to cpu.
+  device: "cuda"
+
+  # Random seed for reproducibility
+  seed: 42
+
+  # Batch size for BPR training
+  batch_size: 1024
+
+  # Total number of epochs for training
+  num_epochs: 500
+
+  # Number of BPR batches per epoch
+  num_batches_per_epoch: 100
+
+  # How often to run validation/testing (per epoch)
+  eval_interval: 2
+
+  # K value for NDCG@K and Hit@K metrics
+  topk: 10
+
+  # Maximum number of users to evaluate (sampling if too large)
+  num_users_eval: 10000
+
+  # Number of negative samples per evaluation user
+  num_neg_eval: 100
+
+  # File path to store the best model checkpoint
+  best_model_path: "checkpoints/ngcf/best_ngcf_model.pth"
+
+
+early_stopping:
+  # Number of evaluations with no improvement before stopping
+  patience: 5
+
+  # Minimum improvement in validation NDCG@K to count as progress
+  min_delta: 0.0
+
+
+model:
+  # Embedding dimension for initial user/item embeddings
+  embed_dim: 64
+
+  # NGCF layer hidden dimensions
+  # Example: [64] for 1 layer, [64, 64] for 2 layers
+  layer_sizes: [64]
+
+  # L2 regularization coefficients (only the first element is used)
+  regs: [1.0e-5]
+
+  # Dropout probability applied to adjacency matrix (node dropout)
+  node_dropout: 0.0
+
+  # Dropout probability applied to message passing outputs
+  # Can be a single float or a list matching number of layers
+  mess_dropout: 0.1
+
+
+optimizer:
+  # Optimizer to use: ["adam", "adamw", "sgd"]
+  name: "adam"
+
+  # Learning rate for optimizer
+  lr: 0.001
+
+  # Weight decay for optimizer (L2 regularization)
+  weight_decay: 0.0
+
+  # Adam optimizer parameters (ignored for SGD)
+  betas: [0.9, 0.999]
