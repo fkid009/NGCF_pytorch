@@ -142,7 +142,8 @@ def evaluator(
     k: int,
     device,
     num_neg: int = 100,
-    user_sample_size: int = 10000,  
+    user_sample_size: int = 10000,
+    is_test: bool = True
 ):
     """
     Evaulate NGCF model with leave-one-out style ranking:
@@ -160,7 +161,10 @@ def evaluator(
 
     # build train and test dicts: user -> list of items
     train_user_pos = data_loader.train_user_pos  # already a dict(user -> set(items))
-    test_user_pos = data_loader.test_user_pos
+    if is_test:
+        test_user_pos = data_loader.test_user_pos
+    else:
+        test_user_pos = data_loader.val_user_pos
 
     # candidate users: those with at least one test item
     all_users = list(test_user_pos.keys())
@@ -189,7 +193,7 @@ def evaluator(
             target = np.random.choice(test_items)
 
             # items already interacted with (train + other test)
-            rated = set(train_user_pos.get(u, set()))
+            rated = set(train_user_pos.get(u, []))
             rated.update(test_items)
 
             # sample negatives
@@ -279,7 +283,9 @@ def trainer(
                 ndcg, hit = evaluator(
                     model,
                     data_loader,
-                    eval_k
+                    eval_k,
+                    device, 
+                    is_test = False                    
                 )
 
             print(f"Eval - NDCG@{eval_k}: {ndcg:.4f}, Hit@{eval_k}: {hit:.4f}")
