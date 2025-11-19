@@ -6,7 +6,7 @@
 # Data settings
 # ------------------------------------------------
 data:
-  fname: "Beauty"              # RAW_DATA_DIR/<fname>.jsonl.gz
+  fname: "Subscription_Boxes"              # RAW_DATA_DIR/<fname>.jsonl.gz
   source: "amazon"
   test_size: 0.2
   seed: 42
