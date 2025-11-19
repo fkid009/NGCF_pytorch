@@ -1,501 +1,299 @@
-import random
 import numpy as np
-from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def scipy_to_torch_sparse(sparse_mtx) -> torch.Tensor:
-    """
-    Convert a scipy.sparse matrix to a torch.sparse.FloatTensor.
-    """
-    sparse_mtx = sparse_mtx.tocoo().astype("float32")
-    indices = torch.from_numpy(
-        np.vstack([sparse_mtx.row, sparse_mtx.col]).astype("int64")
-    )
-    values = torch.from_numpy(sparse_mtx.data)
-    shape = torch.Size(sparse_mtx.shape)
-    return torch.sparse.FloatTensor(indices, values, shape)
 
 class NGCF(nn.Module):
-    """
-    PyTorch implementation of NGCF, aligned with:
-    - Original NGCF paper (SIGIR 2019)
-    - Official TensorFlow implementation
-
-    This version assumes:
-    - DataLoader provides `user_num`, `item_num`
-    - `norm_adj` is a scipy sparse matrix (D^{-1}(A + I) or D^{-1}A).
-    """
-
     def __init__(
         self,
         user_num: int,
         item_num: int,
-        norm_adj,              # scipy sparse matrix
-        embed_dim: int = 64,
-        layer_sizes=(64,),
-        regs=(1e-5,),
-        node_dropout=0.0,
-        mess_dropout=0.1,
-        device: str = "cpu",
+        L: torch.Tensor,
+        embed_dim: int,
+        n_layer: int, 
+        dropout: float,
+        l2_reg: float,
+        negative_slope: float = 0.2,
     ):
         super().__init__()
+
         self.user_num = user_num
         self.item_num = item_num
-        self.n_nodes = user_num + item_num
-
+        self.node_num = self.user_num + self.item_num
         self.embed_dim = embed_dim
-        self.layer_sizes = list(layer_sizes)
-        self.n_layers = len(self.layer_sizes)
+        self.n_layer = n_layer
+        self.dropout = dropout
+        self.l2_reg = l2_reg
+        self.negative_slope = negative_slope
 
-        self.regs = regs
-        self.decay = regs[0]  # same as TF code: use first reg for embedding L2
+        # normalized adjacency (sparse)
+        self.L = L.coalesce()
 
-        self.device = torch.device(device)
+        # node embeddings: users + items
+        self.embedding = nn.Embedding(self.node_num, embed_dim)
 
-        # ------------------------------------------------------------------
-        # Convert adjacency to torch sparse and register as buffer
-        # ------------------------------------------------------------------
-        torch_norm_adj = scipy_to_torch_sparse(norm_adj).to(self.device)
-        # Register as buffer so it's moved with .to(device) and saved in state_dict
-        self.register_buffer("norm_adj", torch_norm_adj)
+        # layer-wise parameters
+        self.W1 = nn.ParameterList()
+        self.W2 = nn.ParameterList()
 
-        # ------------------------------------------------------------------
-        # Embedding parameters
-        # ------------------------------------------------------------------
-        self.user_embedding = nn.Embedding(user_num, embed_dim)
-        self.item_embedding = nn.Embedding(item_num, embed_dim)
+        for _ in range(self.n_layer):
+            w1 = nn.Parameter(torch.empty(embed_dim, embed_dim))
+            w2 = nn.Parameter(torch.empty(embed_dim, embed_dim))
+            nn.init.xavier_uniform_(w1)
+            nn.init.xavier_uniform_(w2)
+            self.W1.append(w1)
+            self.W2.append(w2)
 
-        # Layer dimensions: [input_dim, h1, h2, ...]
-        self.weight_size_list = [embed_dim] + list(layer_sizes)
+        # init embedding weights
+        nn.init.xavier_uniform_(self.embedding.weight)
 
-        # Graph convolution weights (sum and bi-interaction)
-        self.W_gc = nn.ParameterList()
-        self.b_gc = nn.ParameterList()
-        self.W_bi = nn.ParameterList()
-        self.b_bi = nn.ParameterList()
-
-        for k in range(self.n_layers):
-            in_dim = self.weight_size_list[k]
-            out_dim = self.weight_size_list[k + 1]
-
-            self.W_gc.append(nn.Parameter(torch.empty(in_dim, out_dim)))
-            self.b_gc.append(nn.Parameter(torch.empty(1, out_dim)))
-
-            self.W_bi.append(nn.Parameter(torch.empty(in_dim, out_dim)))
-            self.b_bi.append(nn.Parameter(torch.empty(1, out_dim)))
-
-        # Dropout settings: same dropout for all layers for simplicity
-        self.node_dropout = node_dropout
-        # allow list or scalar
-        if isinstance(mess_dropout, (list, tuple)):
-            assert len(mess_dropout) == self.n_layers
-            self.mess_dropout = list(mess_dropout)
-        else:
-            self.mess_dropout = [mess_dropout] * self.n_layers
-
-        # Initialize parameters (xavier)
-        self._init_weights()
-
-    def _init_weights(self):
-        """Xavier initialization for embeddings and weights."""
-        for m in self.modules():
-            if isinstance(m, nn.Embedding):
-                nn.init.xavier_uniform_(m.weight)
-
-        for W in self.W_gc:
-            nn.init.xavier_uniform_(W)
-        for b in self.b_gc:
-            nn.init.zeros_(b)
-
-        for W in self.W_bi:
-            nn.init.xavier_uniform_(W)
-        for b in self.b_bi:
-            nn.init.zeros_(b)
-
-    # ------------------------------------------------------------------
-    # Graph embedding propagation (NGCF)
-    # ------------------------------------------------------------------
-    def _dropout_sparse(self, x: torch.Tensor, keep_prob: float) -> torch.Tensor:
+    def propagate(self):
         """
-        Dropout for torch.sparse.FloatTensor.
+        Multi-layer NGCF propagation.
+
+        Returns
+        -------
+        E_user : (user_num, embed_dim * (n_layer + 1))
+        E_item : (item_num, embed_dim * (n_layer + 1))
         """
-        if keep_prob >= 1.0 or not self.training:
-            return x
 
-        # x._values() shape: (#nonzero,)
-        noise = torch.rand(x._values().size(), device=x.device)
-        dropout_mask = (noise < keep_prob).to(x.dtype)
-        # Keep only selected values
-        new_values = x._values() * dropout_mask / keep_prob
+        E0 = self.embedding.weight  # (node_num, embed_dim)
+        E_list = [E0]
 
-        # Remove zeroed-out entries to keep sparsity clean
-        nonzero_mask = dropout_mask.nonzero(as_tuple=True)[0]
-        new_indices = x._indices()[:, nonzero_mask]
-        new_values = new_values[nonzero_mask]
+        E_prev = E0
 
-        return torch.sparse.FloatTensor(new_indices, new_values, x.shape)
+        for layer in range(self.n_layer):
+            # message passing: side information from neighbors
+            side_E = torch.sparse.mm(self.L, E_prev)  # (node_num, embed_dim)
 
-    def _create_ngcf_embed(self):
+            # (L + I) E_prev = side_E + E_prev
+            sum_E = side_E + E_prev
+
+            # bi-interaction term: element-wise product
+            bi_E = E_prev * side_E
+
+            # linear transforms: (sum_E @ W1) + (bi_E @ W2)
+            E_sum = sum_E @ self.W1[layer]   # (node_num, embed_dim)
+            E_bi  = bi_E  @ self.W2[layer]   # (node_num, embed_dim)
+
+            E_next_pre = E_sum + E_bi
+
+            # LeakyReLU
+            E_next = F.leaky_relu(E_next_pre, negative_slope=self.negative_slope)
+
+            # dropout
+            if self.dropout > 0.0 and self.training:
+                E_next = F.dropout(E_next, p=self.dropout, training=self.training)
+
+            E_prev = E_next
+            E_list.append(E_prev)
+
+        # concat [E0, E1, ..., E_L] along dim=1
+        E_all = torch.cat(E_list, dim=1)  # (node_num, embed_dim * (n_layer + 1))
+
+        # split to user/item
+        E_user = E_all[: self.user_num]
+        E_item = E_all[self.user_num :]
+
+        return E_user, E_item
+
+    def forward(self, user_idx, item_idx):
+        E_user, E_item = self.propagate()
+        return E_user[user_idx], E_item[item_idx]
+
+    def predict(self, user_idx, item_idx):
+        user_emb, item_emb = self.forward(user_idx, item_idx)
+        return (user_emb * item_emb).sum(dim=1)
+
+    def bpr_loss(self, user_idx, pos_idx, neg_idx):
         """
-        Perform NGCF-style embedding propagation over the whole graph.
+        BPR loss using current NGCF embeddings.
 
-        Returns:
-            user_embeddings: (n_users, sum(layer_dims))
-            item_embeddings: (n_items, sum(layer_dims))
+        user_idx : (B,)
+        pos_idx  : (B,)
+        neg_idx  : (B,)
         """
-        # Apply node dropout on adjacency if needed
-        if self.node_dropout > 0.0 and self.training:
-            adj = self._dropout_sparse(self.norm_adj, keep_prob=1.0 - self.node_dropout)
-        else:
-            adj = self.norm_adj
+        E_user, E_item = self.propagate()
 
-        # Initial ego embeddings: concat[user, item]
-        user_emb = self.user_embedding.weight    # (n_users, d)
-        item_emb = self.item_embedding.weight    # (n_items, d)
-        ego_embeddings = torch.cat([user_emb, item_emb], dim=0)  # (n_nodes, d)
+        u_e   = E_user[user_idx]     # (B, D')
+        pos_e = E_item[pos_idx]      # (B, D')
+        neg_e = E_item[neg_idx]      # (B, D')
 
-        all_embeddings = [ego_embeddings]
+        pos_scores = (u_e * pos_e).sum(dim=1)
+        neg_scores = (u_e * neg_e).sum(dim=1)
 
-        for k in range(self.n_layers):
-            # Message passing: A * E
-            side_embeddings = torch.sparse.mm(adj, ego_embeddings)  # (n_nodes, d_k)
+        mf_loss = -F.logsigmoid(pos_scores - neg_scores).mean()
 
-            # Sum-based message
-            sum_embeddings = torch.matmul(side_embeddings, self.W_gc[k]) + self.b_gc[k]
-            sum_embeddings = F.leaky_relu(sum_embeddings)
-
-            # Bi-interaction message
-            bi_interaction = ego_embeddings * side_embeddings
-            bi_embeddings = torch.matmul(bi_interaction, self.W_bi[k]) + self.b_bi[k]
-            bi_embeddings = F.leaky_relu(bi_embeddings)
-
-            # Update ego embeddings
-            ego_embeddings = sum_embeddings + bi_embeddings
-
-            # Message dropout
-            if self.mess_dropout[k] > 0.0:
-                ego_embeddings = F.dropout(
-                    ego_embeddings,
-                    p=self.mess_dropout[k],
-                    training=self.training,
-                )
-
-            # L2 normalize embeddings
-            norm_embeddings = F.normalize(ego_embeddings, p=2, dim=1)
-
-            all_embeddings.append(norm_embeddings)
-
-        # Concatenate embeddings from all layers
-        all_embeddings = torch.cat(all_embeddings, dim=1)  # (n_nodes, d*(L+1))
-
-        # Split back into user and item embeddings
-        user_all_embeddings, item_all_embeddings = torch.split(
-            all_embeddings, [self.user_num, self.item_num], dim=0
-        )
-
-        return user_all_embeddings, item_all_embeddings
-
-    # ------------------------------------------------------------------
-    # Forward for BPR learning
-    # ------------------------------------------------------------------
-    def forward(self, users, pos_items, neg_items):
-        """
-        Args:
-            users: LongTensor of shape (batch_size,)
-            pos_items: LongTensor of shape (batch_size,)
-            neg_items: LongTensor of shape (batch_size,)
-        Returns:
-            u_emb, pos_emb, neg_emb: embeddings after NGCF propagation
-        """
-        # Compute graph-aware embeddings for all users/items
-        user_all_emb, item_all_emb = self._create_ngcf_embed()
-
-        # Select batch embeddings
-        u_emb = user_all_emb[users]              # (B, D*)
-        pos_emb = item_all_emb[pos_items]        # (B, D*)
-        neg_emb = item_all_emb[neg_items]        # (B, D*)
-
-        return u_emb, pos_emb, neg_emb
-
-    # ------------------------------------------------------------------
-    # BPR loss
-    # ------------------------------------------------------------------
-    def bpr_loss(self, users, pos_items, neg_items):
-        """
-        Compute BPR loss and L2 regularization term.
-        """
-        u_emb, pos_emb, neg_emb = self.forward(users, pos_items, neg_items)
-
-        pos_scores = torch.sum(u_emb * pos_emb, dim=1)  # (B,)
-        neg_scores = torch.sum(u_emb * neg_emb, dim=1)  # (B,)
-
-        # BPR loss: -log(sigmoid(pos - neg))
-        mf_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-8).mean()
-
-        # L2 regularization on embeddings (same as TF code)
         reg_loss = (
-            u_emb.norm(2).pow(2)
-            + pos_emb.norm(2).pow(2)
-            + neg_emb.norm(2).pow(2)
-        ) / users.size(0)
+            u_e.norm(2).pow(2)
+            + pos_e.norm(2).pow(2)
+            + neg_e.norm(2).pow(2)
+        ) / user_idx.size(0)
 
-        reg_loss = self.decay * reg_loss
-
-        return mf_loss, reg_loss
-    
-def build_user_item_dict(df) -> Dict[int, list]:
-    """
-    Convert interaction DataFrame (user, item) into {user: [items]} dict.
-    """
-    return df.groupby("user")["item"].apply(list).to_dict()
+        loss = mf_loss + self.l2_reg * reg_loss
+        return loss # , mf_loss.detach(), reg_loss.detach()
 
 
-def evaluate_ngcf(
+def evaluator(
     model,
-    dataset,
-    K: int = 10,
-    num_users_eval: int = 10000,
+    data_loader,
+    k: int,
+    device,
     num_neg: int = 100,
-    split: str = "val",
-) -> Tuple[float, float]:
+    user_sample_size: int = 10000,  
+):
     """
-    Evaluation for NGCF model using NDCG@K and Hit@K.
+    Evaulate NGCF model with leave-one-out style ranking:
+    - For each user with at least one test interaction:
+      - Choose one test item as the target.
+      - Sample `num_neg` negative items.
+      - Rank target among negatives and compute NDCG@k, Hit@k.
 
-    Args:
-        model: NGCF PyTorch model.
-        dataset: tuple of
-            (train_user_items, val_user_items, test_user_items, user_num, item_num)
-        K: cutoff for NDCG@K and Hit@K.
-        num_users_eval: number of users to sample for evaluation
-                        (if fewer users exist, evaluate on all).
-        num_neg: number of negative items to sample for each user.
-        split: either "val" or "test".
-
-    Returns:
-        (NDCG@K, Hit@K)
+    Returns
+    -------
+    ndcg : float
+    hit  : float
     """
-    (
-        train_user_items,
-        val_user_items,
-        test_user_items,
-        user_num,
-        item_num,
-    ) = dataset
+    user_num, item_num = data_loader.user_num, data_loader.item_num
 
-    if split == "val":
-        target_dict = val_user_items
-    elif split == "test":
-        target_dict = test_user_items
-    else:
-        raise ValueError("split must be 'val' or 'test'.")
+    # build train and test dicts: user -> list of items
+    train_user_pos = data_loader.train_user_pos  # already a dict(user -> set(items))
+    test_user_pos = data_loader.test_user_pos
 
-    # Only users that have positive items in this split
-    all_users = list(target_dict.keys())
+    # candidate users: those with at least one test item
+    all_users = list(test_user_pos.keys())
     if len(all_users) == 0:
         return 0.0, 0.0
 
-    # Sample a subset of users if too many
-    if len(all_users) > num_users_eval:
-        users = random.sample(all_users, num_users_eval)
+    if len(all_users) > user_sample_size:
+        users = np.random.choice(all_users, size=user_sample_size, replace=False)
     else:
         users = all_users
 
-    device = model.device if hasattr(model, "device") else next(model.parameters()).device
+    NDCG = 0.0
+    HIT = 0.0
+    valid_user = 0
+
+    all_items = np.arange(item_num)
 
     model.eval()
     with torch.no_grad():
-        # Compute graph-based embeddings for all users/items once
-        user_all_emb, item_all_emb = model._create_ngcf_embed()
-        user_all_emb = user_all_emb.to(device)
-        item_all_emb = item_all_emb.to(device)
+        for u in users:
+            test_items = test_user_pos.get(u, [])
+            if len(test_items) == 0:
+                continue
 
-    NDCG, HR, valid_users = 0.0, 0.0, 0
+            # pick one target test item (leave-one-out 스타일)
+            target = np.random.choice(test_items)
 
-    for u in users:
-        # Training items for this user
-        train_items = set(train_user_items.get(u, []))
-        # Positives in current split
-        pos_items = target_dict.get(u, [])
-        if len(pos_items) == 0:
-            continue
+            # items already interacted with (train + other test)
+            rated = set(train_user_pos.get(u, set()))
+            rated.update(test_items)
 
-        # Choose one target item (similar style to your SASRec evaluation)
-        target = random.choice(pos_items)
+            # sample negatives
+            neg_items = []
+            while len(neg_items) < num_neg:
+                j = np.random.randint(0, item_num)
+                if j not in rated and j not in neg_items:
+                    neg_items.append(j)
 
-        # Build candidate set: 1 positive + num_neg negatives
-        candidate_items = {target}
-        # Avoid recommending items in train + current split
-        forbidden_items = train_items.union(pos_items)
+            # candidate item list = [target] + negatives
+            item_idx = np.array([target] + neg_items, dtype=np.int64)
+            user_idx = np.full_like(item_idx, fill_value=u)
 
-        while len(candidate_items) < num_neg + 1:
-            neg = np.random.randint(0, item_num)
-            if neg not in forbidden_items:
-                candidate_items.add(neg)
+            user_tensor = torch.LongTensor(user_idx).to(device)
+            item_tensor = torch.LongTensor(item_idx).to(device)
 
-        item_idx = list(candidate_items)
+            scores = model.predict(user_tensor, item_tensor)  # (1 + num_neg,)
+            scores = scores.detach().cpu().numpy()
 
-        # Make sure target is at index 0 for convenient rank computation
-        if item_idx[0] != target:
-            t_pos = item_idx.index(target)
-            item_idx[0], item_idx[t_pos] = item_idx[t_pos], item_idx[0]
+            # rank target (index 0) among all candidates (higher score is better)
+            rank = (-scores).argsort().tolist().index(0)
 
-        # ---- Score computation ----
-        u_emb = user_all_emb[u].unsqueeze(0)  # (1, D)
-        item_tensor = torch.tensor(item_idx, dtype=torch.long, device=device)
-        i_emb = item_all_emb[item_tensor]      # (num_items, D)
+            valid_user += 1
 
-        scores = torch.sum(u_emb * i_emb, dim=1)  # (num_items,)
-        scores = scores.detach().cpu().numpy()
+            if rank < k:
+                HIT += 1
+                NDCG += 1 / np.log2(rank + 2)
 
-        # Rank of the target item (index 0 in item_idx)
-        preds = -scores  # higher score -> smaller value after negation
-        ranks = preds.argsort().argsort()
-        rank = int(ranks[0])
-
-        valid_users += 1
-        if rank < K:
-            HR += 1
-            NDCG += 1.0 / np.log2(rank + 2)
-
-    if valid_users == 0:
+    if valid_user == 0:
         return 0.0, 0.0
 
-    return NDCG / valid_users, HR / valid_users
+    ndcg = NDCG / valid_user
+    hit = HIT / valid_user
+    return ndcg, hit
 
-
-
-
-def trainer_ngcf(
+def trainer(
     model,
     data_loader,
     optimizer,
-    num_epochs: int,
-    num_batches: int,
     batch_size: int,
-    eval_interval: int = 2,
-    patience: int = 5,
-    min_delta: float = 0.0,
-    best_model_path: str = "best_ngcf_model.pth",
-    K: int = 10,
-    num_users_eval: int = 10000,
-    num_neg: int = 100,
+    epoch_num: int,
+    num_batches_per_epoch: int,
+    eval_interval: int,
+    eval_k: int,
+    patience,
+    best_model_path,
+    device
 ):
     """
-    Trainer for NGCF with BPR loss, validation & test evaluation.
-
-    Args:
-        model: NGCF model (must define .bpr_loss and .device).
-        data_loader: NGCFDataLoader instance.
-        optimizer: torch optimizer.
-        num_epochs: maximum number of epochs.
-        num_batches: number of batches per epoch.
-        batch_size: batch size for BPR sampling.
-        eval_interval: evaluate every `eval_interval` epochs.
-        patience: early stopping patience w.r.t. validation NDCG@K.
-        min_delta: minimum improvement in validation NDCG@K to be considered as better.
-        best_model_path: where to save the best model weights.
-        K: cutoff for NDCG@K and Hit@K.
-        num_users_eval: maximum number of users to evaluate per split.
-        num_neg: number of negative items for each eval user.
+    Training loop for NGCF with BPR Loss
     """
-    device = model.device if hasattr(model, "device") else next(model.parameters()).device
 
-    # -----------------------------------------------------
-    # Build user->items dicts for evaluation
-    # -----------------------------------------------------
-    train_user_items = build_user_item_dict(data_loader.train)
-    val_user_items = build_user_item_dict(data_loader.val)
-    test_user_items = build_user_item_dict(data_loader.test)
-
-    dataset = (
-        train_user_items,
-        val_user_items,
-        test_user_items,
-        data_loader.user_num,
-        data_loader.item_num,
-    )
-
-    # Best metrics tracking
-    best_val_ndcg = float("-inf")
-    best_val_hr = 0.0
-    best_test_ndcg = 0.0
-    best_test_hr = 0.0
-
-    # Early stopping counter
+    best_ndcg = float("-inf")
+    best_hit = 0.0
     epochs_without_improve = 0
 
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(1, epoch_num + 1):
         model.train()
-        total_mf_loss = 0.0
-        total_reg_loss = 0.0
-
-        for _ in range(num_batches):
-            # ---------------------------
-            # BPR batch sampling
-            # ---------------------------
+        epoch_loss = 0.0
+        
+        for _ in range(num_batches_per_epoch):
             users, pos_items, neg_items = data_loader.get_bpr_batch(batch_size)
-
-            users = torch.from_numpy(users).long().to(device)
-            pos_items = torch.from_numpy(pos_items).long().to(device)
-            neg_items = torch.from_numpy(neg_items).long().to(device)
-
-            mf_loss, reg_loss = model.bpr_loss(users, pos_items, neg_items)
-            loss = mf_loss + reg_loss
+            
+            users = users.to(device)
+            pos_items = pos_items.to(device)
+            neg_items = neg_items.to(device)
 
             optimizer.zero_grad()
+
+            loss = model.bpr_loss(users, pos_items, neg_items)
             loss.backward()
             optimizer.step()
 
-            total_mf_loss += mf_loss.item()
-            total_reg_loss += reg_loss.item()
+            epoch_loss += loss.item()
 
-        avg_mf = total_mf_loss / max(1, num_batches)
-        avg_reg = total_reg_loss / max(1, num_batches)
+        avg_loss = epoch_loss / num_batches_per_epoch
+
         print(
-            f"[Epoch {epoch}] MF Loss: {avg_mf:.4f} | Reg Loss: {avg_reg:.4f} | Total: {avg_mf + avg_reg:.4f}"
+            f"[Epoch {epoch}]"
+            f"Train Loss: {avg_loss:.4f}"
         )
 
-        # -------------------------------
-        # Evaluation & early stopping
-        # -------------------------------
+        # evaluate & early stopping
         if epoch % eval_interval == 0:
             model.eval()
             with torch.no_grad():
-                val_ndcg, val_hr = evaluate_ngcf(
+                ndcg, hit = evaluator(
                     model,
-                    dataset,
-                    K=K,
-                    num_users_eval=num_users_eval,
-                    num_neg=num_neg,
-                    split="val",
-                )
-                test_ndcg, test_hr = evaluate_ngcf(
-                    model,
-                    dataset,
-                    K=K,
-                    num_users_eval=num_users_eval,
-                    num_neg=num_neg,
-                    split="test",
+                    data_loader,
+                    eval_k
                 )
 
-            print(f"  Val  - NDCG@{K}: {val_ndcg:.4f}, Hit@{K}: {val_hr:.4f}")
-            print(f"  Test - NDCG@{K}: {test_ndcg:.4f}, Hit@{K}: {test_hr:.4f}")
+            print(f"Eval - NDCG@{eval_k}: {ndcg:.4f}, Hit@{eval_k}: {hit:.4f}")
 
-            # Check improvement on validation NDCG
-            if val_ndcg > best_val_ndcg + min_delta:
-                best_val_ndcg = val_ndcg
-                best_val_hr = val_hr
-                best_test_ndcg = test_ndcg
-                best_test_hr = test_hr
+            # check improvement
+            if ndcg > best_ndcg:
+                best_ndcg = ndcg
+                best_hit = hit
 
-                # Save best model weights
                 torch.save(model.state_dict(), best_model_path)
                 print(f"  ** Best model updated and saved to '{best_model_path}' **")
 
                 epochs_without_improve = 0
+            
             else:
                 epochs_without_improve += 1
                 print(f"  No improvement. Patience: {epochs_without_improve}/{patience}")
@@ -505,6 +303,5 @@ def trainer_ngcf(
                     break
 
     print("========================================")
-    print(f"Best Validation : NDCG@{K}={best_val_ndcg:.4f}, Hit@{K}={best_val_hr:.4f}")
-    print(f"Best Test       : NDCG@{K}={best_test_ndcg:.4f}, Hit@{K}={best_test_hr:.4f}")
+    print(f"Best Eval : NDCG@{eval_k}={best_ndcg:.4f}, Hit@{eval_k}={best_hit:.4f}")
     print(f"Best model weights saved at: {best_model_path}")
