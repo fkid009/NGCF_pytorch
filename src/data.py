@@ -35,7 +35,8 @@ class NGCFDataLoader:
         ) = self._get_interaction_data()
         self.R = self._build_R()
         self.L = self._build_L()
-        self.user_pos = self._get_user_pos()
+        self.train_user_pos = self._get_user_pos(self.train_df)
+        self.test_user_pos = self._get_user_pos(self.test_df)
 
 
 
@@ -104,11 +105,11 @@ class NGCFDataLoader:
 
         return torch.sparse.FloatTensor(indices, values, shape) # Sparse Tensor
     
-    def _get_user_pos(self):
+    def _get_user_pos(self, df):
         user_pos = defaultdict(set)
 
-        for _, (u, i) in self.train_df.iterrows():
-            user_pos[u].add(i)
+        for _, (u, i) in df.iterrows():
+            user_pos[int(u)].add(int(i))
         return user_pos
     
     def get_bpr_batch(self, batch_size: int):
@@ -146,3 +147,4 @@ class NGCFDataLoader:
             torch.LongTensor(pos_items),
             torch.LongTensor(neg_items)
         )
+
