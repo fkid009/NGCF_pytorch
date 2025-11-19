@@ -1,3 +1,4 @@
+# data.py
 
 import numpy as np
 import scipy.sparse as sp
@@ -15,14 +16,20 @@ class NGCFDataLoader:
         fname,
         source: str = "amazon",
         test_size: float = 0.2,
+        val_size: float = 0.1,
         seed: int = 42
-
     ):
         self.fname = fname
         self.fpath = RAW_DATA_DIR / f"{fname}.jsonl.gz"
         self.source = source
         self.test_size = test_size
+        self.val_size = val_size
         self.seed = seed
+
+        if not (0.0 < self.val_size < self.test_size < 1.0):
+            raise ValueError(
+                f"`val_size`({self.val_size}) must be > 0 and < `test_size`({self.test_size}) < 1.0"
+            )
 
         self.raw_df = self._load_data(self.fpath)
         (
@@ -31,26 +38,29 @@ class NGCFDataLoader:
             self.user_num,
             self.item_num,
             self.train_df,
-            self.test_df
+            self.val_df,
+            self.test_df,
         ) = self._get_interaction_data()
+
         self.R = self._build_R()
         self.L = self._build_L()
+
+        # user -> set(items) for each split
         self.train_user_pos = self._get_user_pos(self.train_df)
+        self.val_user_pos = self._get_user_pos(self.val_df)
         self.test_user_pos = self._get_user_pos(self.test_df)
-
-
 
     def _load_data(self, path):
         return getDF(path).rename(
-            columns = {
+            columns={
                 "user_id": "user",
-                "asin": "item"
+                "asin": "item",
             }
-        )[["user", "item"]]
+        )[["user", "item"]].sample(300)
 
     def _get_interaction_data(self):
         df = self.raw_df.copy()
-        df = df.drop_duplicates(subset = ["user", "item"])
+        df = df.drop_duplicates(subset=["user", "item"])
 
         user2id = {u: idx for idx, u in enumerate(df["user"].unique())}
         item2id = {i: idx for idx, i in enumerate(df["item"].unique())}
@@ -58,24 +68,32 @@ class NGCFDataLoader:
         df["user_idx"] = df["user"].map(user2id)
         df["item_idx"] = df["item"].map(item2id)
 
-        user_num, item_num = df["user_idx"].max() + 1, df["item_idx"].max() + 1
+        user_num = df["user_idx"].max() + 1
+        item_num = df["item_idx"].max() + 1
 
-        train_df, test_df = train_test_split(
+        train_val_df, test_df = train_test_split(
             df[["user_idx", "item_idx"]],
-            test_size = self.test_size,
-            random_state = self.seed
+            test_size=self.test_size,
+            random_state=self.seed,
         )
-        return user2id, item2id, user_num, item_num, train_df, test_df
 
-    def _build_R(self): # Adjacency Matrix
-        R = sp.dok_matrix((self.user_num, self.item_num), dtype = np.float32)
+        val_ratio = self.val_size / (1.0 - self.test_size)
+        train_df, val_df = train_test_split(
+            train_val_df,
+            test_size=val_ratio,
+            random_state=self.seed,
+        )
 
+        return user2id, item2id, user_num, item_num, train_df, val_df, test_df
+
+    def _build_R(self):  # Adjacency Matrix (train only)
+        R = sp.dok_matrix((self.user_num, self.item_num), dtype=np.float32)
         for _, (u, i) in self.train_df.iterrows():
             R[u, i] = 1.0
         return R
 
-    def _build_L(self): # Laplacian Matrix
-        R = self.R.tocsr() # for fast operations
+    def _build_L(self):  # Laplacian Matrix
+        R = self.R.tocsr()  # for fast operations
 
         # sparse zero blocks
         zero_uu = sp.csr_matrix((self.user_num, self.user_num), dtype=np.float32)
@@ -83,18 +101,15 @@ class NGCFDataLoader:
         print(zero_uu.shape)
         print(self.R.shape)
 
-        # top = np.concat([zero_uu, self.R], axis = 1)
-        # bottom = np.concat([self.R.T, zero_ii], axis = 1)
-        # A = np.concat([top, bottom], axis = 0)
         top = sp.hstack([zero_uu, R], format="csr")
         bottom = sp.hstack([R.T, zero_ii], format="csr")
-        A = sp.vstack([top, bottom], format="csr") 
+        A = sp.vstack([top, bottom], format="csr")
 
         # degree
-        d = np.array(A.sum(axis=1)).flatten()          # (N,)
-        D_inv_sqrt = sp.diags(np.power(d + 1e-8, -0.5) )                  # sparse diagonal
+        d = np.array(A.sum(axis=1)).flatten()  # (N,)
+        D_inv_sqrt = sp.diags(np.power(d + 1e-8, -0.5))  # sparse diagonal
 
-        L = D_inv_sqrt @ A @ D_inv_sqrt # Normalized Laplacian Matrix
+        L = D_inv_sqrt @ A @ D_inv_sqrt  # Normalized Laplacian Matrix
         L = L.tocoo().astype(np.float32)
 
         indices = torch.from_numpy(
@@ -103,20 +118,19 @@ class NGCFDataLoader:
         values = torch.from_numpy(L.data)
         shape = torch.Size(L.shape)
 
-        return torch.sparse.FloatTensor(indices, values, shape) # Sparse Tensor
-    
-    def _get_user_pos(self, df):
-        user_pos = defaultdict(set)
+        return torch.sparse.FloatTensor(indices, values, shape)  # Sparse Tensor
 
+    def _get_user_pos(self, df):
+        user_pos = defaultdict(list)
         for _, (u, i) in df.iterrows():
-            user_pos[int(u)].add(int(i))
+            user_pos[int(u)].append(int(i))
         return user_pos
-    
+
     def get_bpr_batch(self, batch_size: int):
         """
-        sample a mini-batch of (user, pos_item, neg_item) triplets for BPR training
+        Sample a mini-batch of (user, pos_item, neg_item) triplets for BPR training
 
-        returns:
+        Returns:
             users: Tensor of shape (batch_size,)
             pos_items: Tensor of shape (batch_size,)
             neg_items: Tensor of shape (batch_size,)
@@ -125,26 +139,25 @@ class NGCFDataLoader:
         pos_items = []
         neg_items = []
 
-        all_times = np.arange(self.item_num)
+        all_items = np.arange(self.item_num)
 
         for _ in range(batch_size):
-            # 1) randomly sample a user at least on interaction
-            u = np.random.choice(list(self.user_pos.keys()))
-            i = np.random.choice(list(self.user_pos[u]))
+            # 1) randomly sample a user with at least one interaction in train
+            u = np.random.choice(list(self.train_user_pos.keys()))
+            i = np.random.choice(list(self.train_user_pos[u]))
 
-            # 2) randomly sample a negative item
+            # 2) randomly sample a negative item (not in train interactions)
             while True:
-                j = np.random.choice(all_times)
-                if j not in self.user_pos[u]:
+                j = np.random.choice(all_items)
+                if j not in self.train_user_pos[u]:
                     break
-            
+
             users.append(u)
             pos_items.append(i)
             neg_items.append(j)
 
         return (
-            torch.LongTensor(users), 
+            torch.LongTensor(users),
             torch.LongTensor(pos_items),
-            torch.LongTensor(neg_items)
+            torch.LongTensor(neg_items),
         )
-
