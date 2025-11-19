@@ -1,10 +1,9 @@
-
 import torch
 
 from src.utils import load_yaml, set_seed
 from src.path import SRC_PATH
 from src.data import NGCFDataLoader
-from model.ngcf import NGCF, trainer
+from model.ngcf import NGCF, trainer, evaluator  
 
 
 # ---------------------------------------------------
@@ -36,7 +35,7 @@ if __name__ == "__main__":
     print(f"[INFO] Using device: {device}")
 
     # ----------------------------
-    # 4. DataLoader 생성
+    # 4. DataLoader
     # ----------------------------
     print("[INFO] Loading data...")
     dataloader = NGCFDataLoader(
@@ -48,13 +47,14 @@ if __name__ == "__main__":
 
     print(f"[INFO] #users: {dataloader.user_num}, #items: {dataloader.item_num}")
     print(f"[INFO] #train interactions: {len(dataloader.train_df)}")
+    print(f"[INFO] #val   interactions: {len(dataloader.val_df)}")
     print(f"[INFO] #test  interactions: {len(dataloader.test_df)}")
 
     # sparse Laplacian
     L = dataloader.L.to(device)
 
     # ----------------------------
-    # 5. Model 생성
+    # 5. Model 
     # ----------------------------
     model = NGCF(
         user_num=dataloader.user_num,
@@ -71,7 +71,7 @@ if __name__ == "__main__":
     print(model)
 
     # ----------------------------
-    # 6. Optimizer 생성
+    # 6. Optimizer 
     # ----------------------------
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -79,7 +79,7 @@ if __name__ == "__main__":
     )
 
     # ----------------------------
-    # 7. Train 루프 실행
+    # 7. Train 
     # ----------------------------
     trainer(
         model=model,
@@ -94,3 +94,21 @@ if __name__ == "__main__":
         best_model_path=path_cfg["best_model_path"],
         device=device,
     )
+
+    # ----------------------------
+    # 8. Load Best model and test
+    # ----------------------------
+    print("[INFO] Loading best model and evaluating on TEST set...")
+    best_state = torch.load(path_cfg["best_model_path"], map_location=device)
+    model.load_state_dict(best_state)
+
+    test_ndcg, test_hit = evaluator(
+        model=model,
+        data_loader=dataloader,
+        k=eval_cfg["k"],
+        device=device,
+        is_test=True,  
+    )
+
+    print("========================================")
+    print(f"[TEST] NDCG@{eval_cfg['k']}: {test_ndcg:.4f}, Hit@{eval_cfg['k']}: {test_hit:.4f}")
