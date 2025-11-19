@@ -56,7 +56,7 @@ class NGCFDataLoader:
                 "user_id": "user",
                 "asin": "item",
             }
-        )[["user", "item"]].sample(300)
+        )[["user", "item"]]
 
     def _get_interaction_data(self):
         df = self.raw_df.copy()
