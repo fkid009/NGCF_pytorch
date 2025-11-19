@@ -136,6 +136,5 @@ Evaluation follows the NGCF setting:
 
 Inspired by the original NGCF paper and official implementations in the recommender systems community.
 
-```
+
 * [https://github.com/xiangwang1223/neural_graph_collaborative_filtering](https://github.com/xiangwang1223/neural_graph_collaborative_filtering)
-```
